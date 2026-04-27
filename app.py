@@ -1,4 +1,6 @@
 import os
+import json
+import tempfile
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
@@ -7,12 +9,33 @@ from google.genai.types import GenerateContentConfig, GoogleSearch, HttpOptions,
 # Load environment variables
 load_dotenv()
 
-PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-MODEL_NAME = os.getenv("VERTEX_MODEL_NAME", "gemini-2.0-flash")
+def _configure_google_credentials_from_secrets():
+    """Support Streamlit Cloud secrets for service-account auth."""
+    # Option 1: secrets section named [gcp_service_account]
+    if "gcp_service_account" in st.secrets:
+        service_account_info = dict(st.secrets["gcp_service_account"])
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp_file:
+            json.dump(service_account_info, tmp_file)
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_file.name
+        return
+
+    # Option 2: one JSON string secret named GOOGLE_APPLICATION_CREDENTIALS_JSON
+    if "GOOGLE_APPLICATION_CREDENTIALS_JSON" in st.secrets:
+        raw_json = st.secrets["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
+        service_account_info = json.loads(raw_json)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp_file:
+            json.dump(service_account_info, tmp_file)
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_file.name
+
+_configure_google_credentials_from_secrets()
+
+PROJECT_ID = os.getenv("GCP_PROJECT_ID") or st.secrets.get("GCP_PROJECT_ID")
+LOCATION = os.getenv("GCP_LOCATION") or st.secrets.get("GCP_LOCATION", "global")
+MODEL_NAME = os.getenv("VERTEX_MODEL_NAME") or st.secrets.get("VERTEX_MODEL_NAME", "gemini-2.0-flash")
 
 if not PROJECT_ID:
-    raise ValueError("Missing GCP_PROJECT_ID in environment variables.")
+    st.error("Missing GCP_PROJECT_ID. Set it in environment or Streamlit secrets.")
+    st.stop()
 
 genai_client = genai.Client(
     vertexai=True,

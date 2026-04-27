@@ -18,12 +18,40 @@ This project uses Streamlit with Google Vertex AI (Gemini) to build an AI news g
    pip install streamlit google-genai python-dotenv
    ```
 
----
+## Deploy on Streamlit Community Cloud
 
-## 📬 Stay Updated with Our Newsletter!
-**Get a FREE Data Science eBook** 📖 with 150+ essential lessons in Data Science when you subscribe to our newsletter! Stay in the loop with the latest tutorials, insights, and exclusive resources. [Subscribe now!](https://join.dailydoseofds.com)
+1. Push this folder to a GitHub repository.
+2. Ensure these files exist at repo root:
+   - `app.py`
+   - `requirements.txt`
+   - `runtime.txt`
+3. In Streamlit Community Cloud, create a new app and select this repo and `app.py`.
+4. In app **Settings > Secrets**, add:
 
-[![Daily Dose of Data Science Newsletter](https://github.com/patchy631/ai-engineering/blob/main/resources/join_ddods.png)](https://join.dailydoseofds.com)
+```toml
+GCP_PROJECT_ID="your-gcp-project-id"
+GCP_LOCATION="global"
+VERTEX_MODEL_NAME="gemini-2.0-flash"
+
+[gcp_service_account]
+type="service_account"
+project_id="your-gcp-project-id"
+private_key_id="..."
+private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email="...@...iam.gserviceaccount.com"
+client_id="..."
+auth_uri="https://accounts.google.com/o/oauth2/auth"
+token_uri="https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url="https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url="https://www.googleapis.com/robot/v1/metadata/x509/..."
+universe_domain="googleapis.com"
+```
+
+5. Save secrets and redeploy.
+
+Notes:
+- Do not commit your service account JSON file to git.
+- Grant the service account Vertex AI permissions in your GCP project.
 
 ---
 

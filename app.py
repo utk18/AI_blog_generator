@@ -36,8 +36,10 @@ def _secret(key: str, default: str | None = None) -> str | None:
 
 NVIDIA_API_KEY = _secret("NVIDIA_API_KEY")
 TAVILY_API_KEY = _secret("TAVILY_API_KEY")
-MODEL_NAME = _secret("NIM_MODEL_NAME", "meta/llama-3.3-70b-instruct")
+MODEL_NAME = _secret("NIM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 NIM_BASE_URL = _secret("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+MAX_OUTPUT_TOKENS = int(_secret("NIM_MAX_OUTPUT_TOKENS", "2048") or 2048)
+SNIPPET_CHARS = int(_secret("TAVILY_SNIPPET_CHARS", "400") or 400)
 _raw_input_price = _secret("NIM_INPUT_PRICE_PER_M")
 _raw_output_price = _secret("NIM_OUTPUT_PRICE_PER_M")
 INPUT_PRICE_PER_M = float(_raw_input_price) if _raw_input_price is not None else None
@@ -68,8 +70,21 @@ with st.sidebar:
     )
 
     st.markdown("### Advanced Settings")
+    model_options = {
+        "Fast — Llama 3.1 8B": "meta/llama-3.1-8b-instruct",
+        "Balanced — Llama 3.3 70B": "meta/llama-3.3-70b-instruct",
+    }
+    default_model_index = next(
+        (i for i, mid in enumerate(model_options.values()) if mid == MODEL_NAME),
+        0,
+    )
+    model_label = st.selectbox("Model", list(model_options.keys()), index=default_model_index)
+    selected_model = model_options[model_label]
+
     temperature = st.slider("Temperature", 0.0, 1.0, 0.7)
-    max_results = st.slider("Search results", 3, 10, 5)
+    max_results = st.slider("Search results", 3, 8, 4)
+    search_depth = st.selectbox("Search depth", ["basic", "advanced"], index=0)
+    max_tokens = st.slider("Max output tokens", 512, 4096, min(MAX_OUTPUT_TOKENS, 2048), step=256)
 
     st.markdown("---")
 
@@ -98,11 +113,11 @@ def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) ->
         return None
     return (prompt_tokens / 1_000_000) * input_rate + (completion_tokens / 1_000_000) * output_rate
 
-def search_sources(topic: str, max_results: int) -> str:
+def search_sources(topic: str, max_results: int, search_depth: str, snippet_chars: int) -> str:
     response = tavily_client.search(
         query=topic,
         max_results=max_results,
-        search_depth="advanced",
+        search_depth=search_depth,
         include_answer=False,
     )
     results = response.get("results", [])
@@ -113,93 +128,153 @@ def search_sources(topic: str, max_results: int) -> str:
     for i, item in enumerate(results, start=1):
         title = item.get("title", "Untitled")
         url = item.get("url", "")
-        content = item.get("content", "")
+        content = item.get("content", "")[:snippet_chars]
         lines.append(f"[{i}] {title}\nURL: {url}\nSnippet: {content}")
     return "\n\n".join(lines)
 
-def call_llm(messages: list[dict], temperature: float) -> tuple[str, dict]:
-    request_payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    logger.info("LLM REQUEST\n%s", json.dumps(request_payload, indent=2, ensure_ascii=False))
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_search_sources(topic: str, max_results: int, search_depth: str, snippet_chars: int) -> str:
+    return search_sources(topic, max_results, search_depth, snippet_chars)
 
-    started = time.perf_counter()
-    response = nim_client.chat.completions.create(**request_payload)
-    latency_ms = (time.perf_counter() - started) * 1000
-
-    content = response.choices[0].message.content or ""
-    usage = response.usage
-    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-    total_tokens = getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
-    cost = estimate_cost_usd(MODEL_NAME, prompt_tokens, completion_tokens)
-
-    trace = {
-        "model": MODEL_NAME,
+def build_trace(
+    model: str,
+    content: str,
+    latency_ms: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    finish_reason: str | None,
+    response_id: str | None,
+) -> dict:
+    total_tokens = prompt_tokens + completion_tokens
+    cost = estimate_cost_usd(model, prompt_tokens, completion_tokens)
+    return {
+        "model": model,
         "latency_ms": round(latency_ms, 1),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
         "estimated_cost_usd": round(cost, 6) if cost is not None else None,
-        "finish_reason": response.choices[0].finish_reason,
-        "response_id": getattr(response, "id", None),
+        "finish_reason": finish_reason,
+        "response_id": response_id,
         "response_preview": content[:500],
     }
+
+def stream_llm(
+    messages: list[dict],
+    temperature: float,
+    model: str,
+    max_tokens: int,
+    trace_out: dict,
+):
+    request_payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    logger.info("LLM REQUEST\n%s", json.dumps({**request_payload, "stream": True}, indent=2, ensure_ascii=False))
+
+    started = time.perf_counter()
+    stream = nim_client.chat.completions.create(**request_payload)
+
+    chunks: list[str] = []
+    finish_reason = None
+    response_id = None
+    prompt_tokens = 0
+    completion_tokens = 0
+
+    for chunk in stream:
+        if chunk.id:
+            response_id = chunk.id
+        if chunk.usage:
+            prompt_tokens = chunk.usage.prompt_tokens or prompt_tokens
+            completion_tokens = chunk.usage.completion_tokens or completion_tokens
+        if not chunk.choices:
+            continue
+        choice = chunk.choices[0]
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+        delta = choice.delta.content
+        if delta:
+            chunks.append(delta)
+            yield delta
+
+    content = "".join(chunks)
+    latency_ms = (time.perf_counter() - started) * 1000
+    trace = build_trace(model, content, latency_ms, prompt_tokens, completion_tokens, finish_reason, response_id)
+    trace_out["trace"] = trace
     logger.info("LLM RESPONSE META\n%s", json.dumps(trace, indent=2, ensure_ascii=False))
     logger.info("LLM RESPONSE BODY\n%s", content)
-    return content, trace
 
-def generate_content(topic: str, temperature: float, max_results: int) -> tuple[str, dict]:
+def generate_content(
+    topic: str,
+    temperature: float,
+    max_results: int,
+    search_depth: str,
+    model: str,
+    max_tokens: int,
+    snippet_chars: int,
+) -> tuple[str, dict]:
     if not topic.strip():
         raise ValueError("Please enter a topic before generating content.")
 
-    sources = search_sources(topic, max_results)
+    sources = cached_search_sources(topic.strip(), max_results, search_depth, snippet_chars)
 
-    prompt = f"""
-You are a senior research analyst and content writer.
-Create a comprehensive markdown blog post about: {topic}
+    prompt = f"""Write a markdown blog post about: {topic}
 
-Use ONLY the search results below as your factual basis. Do not invent sources.
-
-Search results:
+Sources (use only these; cite as [Source: URL]):
 {sources}
 
-Requirements:
-1. Include:
-   - An attention-grabbing H1 title
-   - Executive summary
-   - Well-structured sections with H3 headings
-   - Recent developments, trends, expert insights, and key statistics
-   - A concise conclusion
-2. Cite claims inline using [Source: URL].
-3. End with a References section listing all unique source URLs used.
-4. Keep the writing engaging but factual and precise.
-"""
+Include: H1 title, executive summary, 3-4 H3 sections, conclusion, References list.
+Be factual, concise, and engaging."""
 
-    return call_llm(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-    )
+    trace_out: dict = {}
+
+    def _stream():
+        yield from stream_llm(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            trace_out=trace_out,
+        )
+
+    return _stream, trace_out
 
 if generate_button:
-    with st.spinner("Generating content... This may take a moment."):
-        try:
-            result, trace = generate_content(topic, temperature, max_results)
-            st.markdown("### Generated Content")
-            st.markdown(result)
-
-            with st.expander("LLM trace (tokens / cost)"):
-                st.json(trace)
-
-            st.download_button(
-                label="Download Content",
-                data=result,
-                file_name=f"{topic.lower().replace(' ', '_')}_article.md",
-                mime="text/markdown",
+    try:
+        with st.status("Searching the web...", expanded=False) as search_status:
+            stream_fn, trace_out = generate_content(
+                topic, temperature, max_results, search_depth, selected_model, max_tokens, SNIPPET_CHARS
             )
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
+            search_status.update(label="Search complete", state="complete")
+
+        st.markdown("### Generated Content")
+        gen_loader = st.status("Generating article with NVIDIA NIM...", state="running", expanded=False)
+
+        def stream_with_loader():
+            first_chunk = True
+            for chunk in stream_fn():
+                if first_chunk:
+                    gen_loader.update(label="Article generated", state="complete")
+                    first_chunk = False
+                yield chunk
+
+        result = st.write_stream(stream_with_loader)
+        trace = trace_out.get("trace", {})
+
+        with st.expander("LLM trace (tokens / cost)"):
+            st.json(trace)
+
+        st.download_button(
+            label="Download Content",
+            data=result,
+            file_name=f"{topic.lower().replace(' ', '_')}_article.md",
+            mime="text/markdown",
+        )
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
 st.markdown("---")
 st.markdown("Built with Streamlit, NVIDIA NIM, and Tavily")

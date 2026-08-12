@@ -1,78 +1,80 @@
-import os
 import json
-import tempfile
+import logging
+import os
+import time
+
 import streamlit as st
 from dotenv import load_dotenv
-from google import genai
-from google.genai.types import GenerateContentConfig, GoogleSearch, HttpOptions, Tool
+from openai import OpenAI
+from tavily import TavilyClient
 
-# Load environment variables
 load_dotenv()
 
-def _configure_google_credentials_from_secrets():
-    """Support Streamlit Cloud secrets for service-account auth."""
-    # Option 1: secrets section named [gcp_service_account]
-    if "gcp_service_account" in st.secrets:
-        service_account_info = dict(st.secrets["gcp_service_account"])
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp_file:
-            json.dump(service_account_info, tmp_file)
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_file.name
-        return
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    force=True,
+)
+logger = logging.getLogger("llm_trace")
 
-    # Option 2: one JSON string secret named GOOGLE_APPLICATION_CREDENTIALS_JSON
-    if "GOOGLE_APPLICATION_CREDENTIALS_JSON" in st.secrets:
-        raw_json = st.secrets["GOOGLE_APPLICATION_CREDENTIALS_JSON"]
-        service_account_info = json.loads(raw_json)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp_file:
-            json.dump(service_account_info, tmp_file)
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_file.name
+# Approx $/1M tokens for estimate only — override via env if needed.
+# Hosted NIM free tier may bill $0; treat these as budgeting estimates.
+DEFAULT_PRICING_PER_M = {
+    "meta/llama-3.3-70b-instruct": {"input": 0.60, "output": 1.80},
+    "meta/llama-3.1-70b-instruct": {"input": 0.60, "output": 1.80},
+    "meta/llama-3.1-8b-instruct": {"input": 0.05, "output": 0.15},
+}
 
-_configure_google_credentials_from_secrets()
+def _secret(key: str, default: str | None = None) -> str | None:
+    value = os.getenv(key)
+    if value:
+        return value
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
 
-PROJECT_ID = os.getenv("GCP_PROJECT_ID") or st.secrets.get("GCP_PROJECT_ID")
-LOCATION = os.getenv("GCP_LOCATION") or st.secrets.get("GCP_LOCATION", "global")
-MODEL_NAME = os.getenv("VERTEX_MODEL_NAME") or st.secrets.get("VERTEX_MODEL_NAME", "gemini-2.0-flash")
-
-if not PROJECT_ID:
-    st.error("Missing GCP_PROJECT_ID. Set it in environment or Streamlit secrets.")
+NVIDIA_API_KEY = _secret("NVIDIA_API_KEY")
+TAVILY_API_KEY = _secret("TAVILY_API_KEY")
+MODEL_NAME = _secret("NIM_MODEL_NAME", "meta/llama-3.3-70b-instruct")
+NIM_BASE_URL = _secret("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+_raw_input_price = _secret("NIM_INPUT_PRICE_PER_M")
+_raw_output_price = _secret("NIM_OUTPUT_PRICE_PER_M")
+INPUT_PRICE_PER_M = float(_raw_input_price) if _raw_input_price is not None else None
+OUTPUT_PRICE_PER_M = float(_raw_output_price) if _raw_output_price is not None else None
+if not NVIDIA_API_KEY:
+    st.error("Missing NVIDIA_API_KEY. Set it in environment or Streamlit secrets.")
     st.stop()
 
-genai_client = genai.Client(
-    vertexai=True,
-    project=PROJECT_ID,
-    location=LOCATION,
-    http_options=HttpOptions(api_version="v1"),
-)
+if not TAVILY_API_KEY:
+    st.error("Missing TAVILY_API_KEY. Set it in environment or Streamlit secrets.")
+    st.stop()
 
-# Streamlit page config
+nim_client = OpenAI(base_url=NIM_BASE_URL, api_key=NVIDIA_API_KEY)
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+
 st.set_page_config(page_title="AI News Generator", page_icon="📰", layout="wide")
 
-# Title and description
-st.title("🤖 AI News Generator, powered by Google Vertex AI")
+st.title("🤖 AI News Generator, powered by NVIDIA NIM + Tavily")
 st.markdown("Generate comprehensive blog posts about any topic using AI agents.")
 
-# Sidebar
 with st.sidebar:
     st.header("Content Settings")
-    
-    # Make the text input take up more space
+
     topic = st.text_area(
         "Enter your topic",
         height=100,
         placeholder="Enter the topic you want to generate content about..."
     )
-    
-    # Add more sidebar controls if needed
+
     st.markdown("### Advanced Settings")
     temperature = st.slider("Temperature", 0.0, 1.0, 0.7)
-    
-    # Add some spacing
+    max_results = st.slider("Search results", 3, 10, 5)
+
     st.markdown("---")
-    
-    # Make the generate button more prominent in the sidebar
+
     generate_button = st.button("Generate Content", type="primary", use_container_width=True)
-    
-    # Add some helpful information
+
     with st.expander("ℹ️ How to use"):
         st.markdown("""
         1. Enter your desired topic in the text area above
@@ -82,55 +84,122 @@ with st.sidebar:
         5. Download the result as a markdown file
         """)
 
-def generate_content(topic):
+def _pricing_for(model: str) -> tuple[float | None, float | None]:
+    if INPUT_PRICE_PER_M is not None and OUTPUT_PRICE_PER_M is not None:
+        return INPUT_PRICE_PER_M, OUTPUT_PRICE_PER_M
+    rates = DEFAULT_PRICING_PER_M.get(model)
+    if not rates:
+        return None, None
+    return rates["input"], rates["output"]
+
+def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float | None:
+    input_rate, output_rate = _pricing_for(model)
+    if input_rate is None or output_rate is None:
+        return None
+    return (prompt_tokens / 1_000_000) * input_rate + (completion_tokens / 1_000_000) * output_rate
+
+def search_sources(topic: str, max_results: int) -> str:
+    response = tavily_client.search(
+        query=topic,
+        max_results=max_results,
+        search_depth="advanced",
+        include_answer=False,
+    )
+    results = response.get("results", [])
+    if not results:
+        return "No search results found."
+
+    lines = []
+    for i, item in enumerate(results, start=1):
+        title = item.get("title", "Untitled")
+        url = item.get("url", "")
+        content = item.get("content", "")
+        lines.append(f"[{i}] {title}\nURL: {url}\nSnippet: {content}")
+    return "\n\n".join(lines)
+
+def call_llm(messages: list[dict], temperature: float) -> tuple[str, dict]:
+    request_payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    logger.info("LLM REQUEST\n%s", json.dumps(request_payload, indent=2, ensure_ascii=False))
+
+    started = time.perf_counter()
+    response = nim_client.chat.completions.create(**request_payload)
+    latency_ms = (time.perf_counter() - started) * 1000
+
+    content = response.choices[0].message.content or ""
+    usage = response.usage
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+    total_tokens = getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens)
+    cost = estimate_cost_usd(MODEL_NAME, prompt_tokens, completion_tokens)
+
+    trace = {
+        "model": MODEL_NAME,
+        "latency_ms": round(latency_ms, 1),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "estimated_cost_usd": round(cost, 6) if cost is not None else None,
+        "finish_reason": response.choices[0].finish_reason,
+        "response_id": getattr(response, "id", None),
+        "response_preview": content[:500],
+    }
+    logger.info("LLM RESPONSE META\n%s", json.dumps(trace, indent=2, ensure_ascii=False))
+    logger.info("LLM RESPONSE BODY\n%s", content)
+    return content, trace
+
+def generate_content(topic: str, temperature: float, max_results: int) -> tuple[str, dict]:
     if not topic.strip():
         raise ValueError("Please enter a topic before generating content.")
+
+    sources = search_sources(topic, max_results)
 
     prompt = f"""
 You are a senior research analyst and content writer.
 Create a comprehensive markdown blog post about: {topic}
 
+Use ONLY the search results below as your factual basis. Do not invent sources.
+
+Search results:
+{sources}
+
 Requirements:
-1. Use Google Search grounding to gather recent, reliable sources.
-2. Include:
+1. Include:
    - An attention-grabbing H1 title
    - Executive summary
    - Well-structured sections with H3 headings
    - Recent developments, trends, expert insights, and key statistics
    - A concise conclusion
-3. Cite claims inline using [Source: URL].
-4. End with a References section listing all unique source URLs.
-5. Keep the writing engaging but factual and precise.
+2. Cite claims inline using [Source: URL].
+3. End with a References section listing all unique source URLs used.
+4. Keep the writing engaging but factual and precise.
 """
 
-    response = genai_client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=GenerateContentConfig(
-            temperature=temperature,
-            tools=[Tool(google_search=GoogleSearch())],
-        ),
+    return call_llm(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
     )
-    return response.text
 
-# Main content area
 if generate_button:
-    with st.spinner('Generating content... This may take a moment.'):
+    with st.spinner("Generating content... This may take a moment."):
         try:
-            result = generate_content(topic)
+            result, trace = generate_content(topic, temperature, max_results)
             st.markdown("### Generated Content")
             st.markdown(result)
-            
-            # Add download button
+
+            with st.expander("LLM trace (tokens / cost)"):
+                st.json(trace)
+
             st.download_button(
                 label="Download Content",
                 data=result,
                 file_name=f"{topic.lower().replace(' ', '_')}_article.md",
-                mime="text/markdown"
+                mime="text/markdown",
             )
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
-
-# Footer
 st.markdown("---")
-st.markdown("Built with Streamlit and powered by Google Vertex AI")
+st.markdown("Built with Streamlit, NVIDIA NIM, and Tavily")

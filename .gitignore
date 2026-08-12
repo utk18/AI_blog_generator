@@ -1,0 +1,18 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local / scratch
+.DS_Store
+*.log
+.idea/
+.vscode/
